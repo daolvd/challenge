@@ -2,14 +2,17 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { generate, MAX_REVISIONS, MAX_RETRIES } from "../lib/pipeline";
 
 /**
- * Real-world edge cases the gate tests (pipeline.test.ts) don't reach.
+ * Real-world edge cases the gate tests (pipeline.test.ts) don't assert on.
  *
  * The pipeline runs in two streaming stages: an initial draft (up to MAX_RETRIES
- * attempts, with backoff) and a revision loop (up to MAX_REVISIONS rounds). Each
- * revision round RE-GENERATES the draft and then reviews it — so a round can fail
- * either because re-generation errored (rate limit / truncation) or because the
- * reviewer rejected it. Both consume one of the MAX_REVISIONS rounds. Worst case
- * the model is streamed MAX_RETRIES + MAX_REVISIONS (= 6) times.
+ * attempts, with backoff) and a revision loop (up to MAX_REVISIONS rounds) that
+ * re-generates the draft and reviews it each round. Worst case the model is
+ * streamed MAX_RETRIES + MAX_REVISIONS (= 6) times.
+ *
+ * These use only the three built-in mock behaviors (anthropic-mock.ts is frozen):
+ * "ok", "truncate-once", "transient-429-twice". A generation error *inside* the
+ * revision loop is therefore not exercisable here — triggering it would require a
+ * mock that fails on a later call, which we are not allowed to add.
  */
 
 afterEach(() => {
@@ -22,8 +25,8 @@ describe("the run is bounded to MAX_RETRIES + MAX_REVISIONS model calls", () => 
   });
 });
 
-describe("revision loop — re-generates then reviews, passing on a later round", () => {
-  it("keeps re-generating until review passes and reports the round reached", async () => {
+describe("revision loop — reviews each round, passing on a later round", () => {
+  it("keeps going until review passes and reports the round reached", async () => {
     const reviewed: number[] = [];
     const advanceToNextStage = vi.fn(async () => {});
 
@@ -40,63 +43,6 @@ describe("revision loop — re-generates then reviews, passing on a later round"
     expect(res.status).toBe("ok");
     expect(res.attempts).toBe(2);
     expect(advanceToNextStage).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("a re-generation error during revision consumes a round and recovers", () => {
-  it("counts a truncated re-generation as one round, then succeeds on the next", async () => {
-    const reviewed: number[] = [];
-
-    const res = await generate({
-      behavior: "truncate-on-revision", // round 0's re-generation is truncated
-      advanceToNextStage: async () => {},
-      reviewPasses: (revision) => {
-        reviewed.push(revision);
-        return true;
-      },
-    });
-
-    // Round 0 failed in re-generation before review ran, so review only saw round 1.
-    expect(reviewed).toEqual([1]);
-    expect(res.status).toBe("ok");
-    expect(res.attempts).toBe(1);
-  });
-
-  it("shares the MAX_REVISIONS budget between generation errors and rejections", async () => {
-    const reviewed: number[] = [];
-
-    const res = await generate({
-      behavior: "truncate-on-revision", // round 0 re-generation truncates...
-      advanceToNextStage: async () => {},
-      // ...round 1 is rejected, round 2 passes — all three rounds are spent.
-      reviewPasses: (revision) => {
-        reviewed.push(revision);
-        return revision === 2;
-      },
-    });
-
-    expect(reviewed).toEqual([1, 2]); // round 0 never reached review
-    expect(res.status).toBe("ok");
-    expect(res.attempts).toBe(2);
-  });
-});
-
-describe("the revision loop gives up when re-generation keeps failing", () => {
-  it("stops after MAX_REVISIONS truncated re-generations and never hands off", async () => {
-    const reviewPasses = vi.fn(() => true);
-    const advanceToNextStage = vi.fn(async () => {});
-
-    const res = await generate({
-      behavior: "truncate-every-revision", // every re-generation truncates
-      advanceToNextStage,
-      reviewPasses,
-    });
-
-    expect(res.status).toBe("error");
-    expect(res.attempts).toBe(MAX_REVISIONS);
-    // Generation failed before review each round, and the run never advanced.
-    expect(reviewPasses).not.toHaveBeenCalled();
-    expect(advanceToNextStage).not.toHaveBeenCalled();
   });
 });
 
@@ -136,7 +82,7 @@ describe("both stages combined", () => {
   });
 });
 
-describe("failures are logged distinctly, with a timestamp and duration", () => {
+describe("initial-stream failures are logged distinctly, with a timestamp and duration", () => {
   it("logs a different, timestamped message for a rate limit vs a truncated stream", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -147,9 +93,9 @@ describe("failures are logged distinctly, with a timestamp and duration", () => 
       reviewPasses: () => true,
     });
 
-    // A truncated re-generation in the revision loop.
+    // A truncated initial stream.
     await generate({
-      behavior: "truncate-on-revision",
+      behavior: "truncate-once",
       advanceToNextStage: async () => {},
       reviewPasses: () => true,
     });
