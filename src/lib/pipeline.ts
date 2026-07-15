@@ -1,131 +1,175 @@
 import { extractJson } from "./extract-json";
-import {
-  mockStream,
-  type MockBehavior,
-  type MockState,
-  type TransientError,
-} from "./anthropic-mock";
+import { mockStream, type MockBehavior, type MockState } from "./anthropic-mock";
+import { buildRetry } from "./retry";
 
 export interface GenerateInput {
   /** Drives the mock streaming client (see anthropic-mock.ts). */
   behavior: MockBehavior;
   /** Hands the finished draft to the next pipeline stage. May reject. */
   advanceToNextStage: () => Promise<void>;
-  /** Returns true once the draft passes review. Scripted by callers/tests. */
+  /** Returns true once the given revision passes review. Scripted by callers/tests. */
   reviewPasses: (revision: number) => boolean;
 }
 
 export interface GenerateResult {
   status: "ok" | "error";
-  /** Review rounds spent. Zero when the run never got as far as review. */
   attempts: number;
-  /** The extracted draft, present only on a successful run. */
-  draft?: unknown;
-  /** Why the run failed, present only on an unsuccessful run. */
-  reason?: string;
 }
 
-/** How many times a draft may be reviewed before the run is declared stuck. */
-export const MAX_REVISIONS = 3;
+/** Initial-draft stream: transient errors (rate limits) + truncated streams. */
+const MAX_RETRIES = 3;
+/** Revision rounds: each re-generates the draft and re-reviews it. */
+const MAX_REVISIONS = 3;
+// Worst case the model is streamed MAX_RETRIES + MAX_REVISIONS (= 6) times per run.
 
-/** How many times a single draft may be streamed before the run gives up. */
-export const MAX_STREAM_ATTEMPTS = 3;
+/** The distinct ways a single attempt can fail, each logged differently. */
+type FailureKind = "rate-limited" | "truncated" | "review-rejected";
 
-function messageOf(err: unknown): string {
+/** A distinct, human-readable cause per failure kind. */
+const FAILURE_DESCRIPTION: Record<FailureKind, string> = {
+  "rate-limited": "upstream rate-limited the request (429)",
+  truncated: "stream returned incomplete JSON (truncated mid-response)",
+  "review-rejected": "reviewer rejected the draft",
+};
+
+/** Thrown when a re-generated draft streams fine but the reviewer rejects it. */
+class ReviewRejected extends Error {
+  constructor(revision: number) {
+    super(`draft rejected at revision ${revision}`);
+    this.name = "ReviewRejected";
+  }
+}
+
+/** Normalises a thrown value into a human-readable reason string. */
+function errorReason(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function failure(attempts: number, reason: string): GenerateResult {
-  return { status: "error", attempts, reason };
+/** Buckets a thrown value into one of the known failure kinds. */
+function classifyFailure(err: unknown): FailureKind {
+  if (err instanceof ReviewRejected) return "review-rejected";
+  if ((err as { status?: number }).status === 429) return "rate-limited";
+  return "truncated";
 }
 
 /**
- * Whether re-running the same stream could plausibly do better.
- *
- * Two failures qualify. Transient API errors — a rate limit or a server-side
- * blip — say nothing about the request itself. And a truncated response leaves
- * the JSON block unterminated, so extraction throws; those errors carry no HTTP
- * status, which is what tells them apart from an API rejection.
- *
- * Everything else — a 4xx that is not a rate limit, say — is fatal: retrying
- * only burns the budget on a request that will keep failing the same way.
+ * Logs a failed attempt with a message distinct to its kind, its position in the
+ * attempt budget, and how long the attempt took — so rate limits, truncated
+ * streams and review rejections are each recognisable at a glance in the logs.
  */
-function isWorthRestreaming(err: unknown): boolean {
-  const status = (err as TransientError | undefined)?.status;
-  if (status === undefined) return true;
-  return status === 429 || (status >= 500 && status < 600);
+function logFailure(
+  stage: "draft-stream" | "revision",
+  err: unknown,
+  attempt: number,
+  maxAttempts: number,
+  elapsedMs: number,
+): void {
+  const kind = classifyFailure(err);
+  console.warn(
+    `[pipeline] ${new Date().toISOString()} ${stage} attempt ${attempt}/${maxAttempts} ` +
+      `failed in ${elapsedMs}ms — ${kind}: ${FAILURE_DESCRIPTION[kind]} (${errorReason(err)})`,
+  );
 }
 
-/** Streams a draft and extracts its JSON, re-streaming on recoverable failures. */
-async function streamDraft(
+/** Streams one draft and validates its JSON. Throws on truncation/transient errors. */
+async function generateDraft(behavior: MockBehavior, state: MockState): Promise<void> {
+  const text = await mockStream(behavior, state);
+  extractJson(text); // throws when the stream was truncated mid-JSON
+}
+
+/**
+ * Stage 1 — produce the initial draft, retrying transient failures (rate limits)
+ * and truncated streams with exponential backoff instead of hammering the
+ * upstream. Up to MAX_RETRIES attempts; throws if every one fails.
+ */
+async function streamInitialDraft(behavior: MockBehavior, state: MockState): Promise<void> {
+  let startedAt = 0;
+  const withRetry = buildRetry({
+    maxAttempts: MAX_RETRIES,
+    onError: (err, attempt) =>
+      logFailure("draft-stream", err, attempt, MAX_RETRIES, Date.now() - startedAt),
+  });
+
+  await withRetry(async () => {
+    startedAt = Date.now();
+    await generateDraft(behavior, state);
+  });
+}
+
+interface ReviewOutcome {
+  passed: boolean;
+  /** Revision index the loop reached (0-based). */
+  attempts: number;
+}
+
+/**
+ * Stage 2 — re-generate the draft and review it, up to MAX_REVISIONS rounds. A
+ * round is retried whether re-generation errored (rate limit / truncation) or the
+ * reviewer rejected the draft; both consume one of the MAX_REVISIONS attempts and
+ * are logged with their distinct cause. No backoff: this is a fast review cycle,
+ * not a flaky-network wait.
+ */
+async function reviseUntilApproved(
   behavior: MockBehavior,
   state: MockState,
-): Promise<unknown> {
-  let lastError: unknown;
+  reviewPasses: (revision: number) => boolean,
+): Promise<ReviewOutcome> {
+  let attempts = 0;
+  let startedAt = 0;
+  const withRetry = buildRetry({
+    maxAttempts: MAX_REVISIONS,
+    baseDelayMs: 0,
+    onError: (err, attempt) =>
+      logFailure("revision", err, attempt, MAX_REVISIONS, Date.now() - startedAt),
+  });
 
-  for (let attempt = 1; attempt <= MAX_STREAM_ATTEMPTS; attempt += 1) {
-    try {
-      return extractJson(await mockStream(behavior, state));
-    } catch (err) {
-      if (!isWorthRestreaming(err)) throw err;
-      lastError = err;
-    }
+  try {
+    await withRetry(async (n) => {
+      const revision = n - 1;
+      attempts = revision;
+      startedAt = Date.now();
+
+      await generateDraft(behavior, state); // re-generate before re-reviewing
+      if (!reviewPasses(revision)) {
+        throw new ReviewRejected(revision);
+      }
+    });
+    return { passed: true, attempts };
+  } catch {
+    return { passed: false, attempts };
   }
-
-  throw lastError;
 }
 
 /**
- * Reviews the draft until it is approved, up to MAX_REVISIONS rounds. A reviewer
- * that never accepts must fail the run rather than spin on it, so the caller is
- * told how many rounds were spent either way.
- *
- * `reviewPasses` numbers revisions from zero; `attempts` counts them from one.
- */
-function review(reviewPasses: GenerateInput["reviewPasses"]): {
-  approved: boolean;
-  attempts: number;
-} {
-  for (let revision = 0; revision < MAX_REVISIONS; revision += 1) {
-    if (reviewPasses(revision)) {
-      return { approved: true, attempts: revision + 1 };
-    }
-  }
-
-  return { approved: false, attempts: MAX_REVISIONS };
-}
-
-/**
- * Runs one content-generation pass: stream a draft, revise it until it passes
- * review, then hand it to the next stage.
- *
- * Every failure mode resolves to `status: "error"` — a stalled run must never
- * report itself as healthy.
+ * Runs one content-generation pass: stream the initial draft, then re-generate
+ * and review it until it passes, then hand off to the next stage. Any stage
+ * failing short-circuits the run into an `error` result.
  */
 export async function generate(input: GenerateInput): Promise<GenerateResult> {
   const state: MockState = { calls: 0 };
 
-  let draft: unknown;
   try {
-    draft = await streamDraft(input.behavior, state);
+    await streamInitialDraft(input.behavior, state);
   } catch (err) {
-    return failure(0, messageOf(err));
-  }
-
-  const { approved, attempts } = review(input.reviewPasses);
-  if (!approved) {
-    return failure(
-      attempts,
-      `Draft still failing review after ${MAX_REVISIONS} attempts`,
+    console.error(
+      `[pipeline] draft stream gave up after ${state.calls} attempts: ${errorReason(err)}`,
     );
+    return { status: "error", attempts: state.calls };
   }
 
-  // The hand-off is part of the run: if it rejects, the run failed.
+  const review = await reviseUntilApproved(input.behavior, state, input.reviewPasses);
+  if (!review.passed) {
+    return { status: "error", attempts: MAX_REVISIONS };
+  }
+
   try {
     await input.advanceToNextStage();
   } catch (err) {
-    return failure(attempts, messageOf(err));
+    console.error(`[pipeline] hand-off to next stage failed: ${errorReason(err)}`);
+    return { status: "error", attempts: review.attempts };
   }
 
-  return { status: "ok", attempts, draft };
+  return { status: "ok", attempts: review.attempts };
 }
+
+export { MAX_REVISIONS, MAX_RETRIES };
